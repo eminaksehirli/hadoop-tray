@@ -12,6 +12,8 @@ import static java.util.Collections.emptyList;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static java.util.stream.Collectors.toList;
+import static javax.swing.JOptionPane.INFORMATION_MESSAGE;
+import static javax.swing.JOptionPane.showMessageDialog;
 
 import java.awt.AWTException;
 import java.awt.Color;
@@ -24,7 +26,6 @@ import java.awt.MenuItem;
 import java.awt.PopupMenu;
 import java.awt.SystemTray;
 import java.awt.TrayIcon;
-import java.awt.TrayIcon.MessageType;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
@@ -36,9 +37,15 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.prefs.BackingStoreException;
+import java.util.prefs.NodeChangeEvent;
+import java.util.prefs.NodeChangeListener;
+import java.util.prefs.Preferences;
 import javax.script.ScriptEngine;
 import javax.script.ScriptEngineManager;
 import javax.script.ScriptException;
+import javax.swing.JOptionPane;
 import lombok.AllArgsConstructor;
 import lombok.Value;
 import org.jsoup.Jsoup;
@@ -46,10 +53,9 @@ import org.jsoup.nodes.Document;
 import org.jsoup.select.Elements;
 
 public class Runner {
-  public final static String Url = "http://ds-ga-nn:8088/cluster/apps/RUNNING";
+  public final static String Running = "RUNNING";
   private static ScheduledExecutorService scheduler;
   private static int state = 0; // 0 not running, 1 there are running jobs
-  // private static int numOfRunningJobs = 0; // my jobs
   private static List<JobInfo> myRunningJobs = emptyList();
   private static List<JobInfo> runningJobs = emptyList();
 
@@ -60,45 +66,54 @@ public class Runner {
   private static TrayIcon trayIcon;
   private static double vCoresUsed;
   private static double vCoresTotal;
-  private static String browseUrl = "http://ds-ga-nn:8088/cluster/app/";
   private static Color textColor;
 
-  private static boolean shouldNotify = true;
+  private static boolean shouldNotify = false;
+  private static ScheduledFuture<?> poller;
 
+  private static Options options;
 
-  public static void main(String[] args) throws AWTException {
+  private static int currentFrequency = 0;
 
-    // TrayIcon newTrayIcon = createTrayIcon();
-    // trayIcon = newTrayIcon;
-    // getSystemTray().add(trayIcon);
+  public static void main(String[] args) {
+    options = new Options(() -> updateOptions());
+    if (options.getUser().isEmpty()) {
+      showMessageDialog(null,
+          "<html>Hello <b>" + System.getProperty("user.name") + "</b>!\n"
+              + "It looks like this is the first time you are using this application.\n"
+              + "We need you some information from you.",
+          "Welcome to Hadoop Monitor!", INFORMATION_MESSAGE);
+      options.openDialog(() -> run());
+    } else {
+      run();
+    }
+  }
 
-    // UIDefaults defaults = UIManager.getLookAndFeelDefaults();
-    // System.out.println(defaults);
-    // for (Object key : defaults.keySet()) {
-    // System.out.println(key.toString() + ": " + defaults.get(key).toString());
-    // }
-
+  private static void run() {
     if (!SystemTray.isSupported()) {
+      showMessageDialog(null, "Sytem tray is not supported :( Exiting.", "Not supported",
+          JOptionPane.ERROR_MESSAGE);
       System.err.println("Sytem tray is not supported :(");
+      System.exit(1);
     }
     PopupMenu pm = new PopupMenu("Hadoop");
     addQuitTo(pm);
 
-    Image image = newImageWithText(width, height, "Hello");
-    trayIcon = new TrayIcon(image);
+    trayIcon = new TrayIcon(newImageWithText(width, height, "Hello"));
     trayIcon.setPopupMenu(pm);
-    getSystemTray().add(trayIcon);
-    trayIcon.displayMessage("Hello, World", "notification demo", MessageType.WARNING);
+    try {
+      getSystemTray().add(trayIcon);
+    } catch (AWTException e) {
+      showMessageDialog(null, "Cannot add the tray icon.");
+      e.printStackTrace();
+    }
 
     scheduler = Executors.newScheduledThreadPool(1);
 
-    checkJobs();
+    poller = scheduler.scheduleAtFixedRate(() -> checkJobs(), 0, 60, SECONDS);
   }
 
   private static void checkJobs() {
-    int delay = 60;
-    // textColor = UIManager.getColor("MenuBar.highlight");
-    // textColor = UIManager.getColor("MenuBar.foreground");
     if (shouldNotify) {
       textColor = red;
     } else if (isMacMenuBarDarkMode()) {
@@ -109,20 +124,15 @@ public class Runner {
     try {
       List<JobInfo> jobs = fetchJobs();
       runningJobs = jobs;
-      System.out.println(jobs);
 
       List<JobInfo> myJobs =
-          jobs.stream().filter(j -> j.user.equals("aksehirli")).collect(toList());
+          jobs.stream().filter(j -> j.user.equals(options.getUser())).collect(toList());
       int numOfMyJobs = myJobs.size();
-      System.out.println(numOfMyJobs);
 
       if (numOfMyJobs > 0) {
-        delay = 10;
         textColor = blue;
+
         if (state == 1 && myRunningJobs.size() == numOfMyJobs) {
-          // System.out.println("DEBUG: No new jobs, returning.");
-          scheduler.schedule(() -> checkJobs(), delay, SECONDS);
-          // System.out.println("Schedule a new check with delay of " + delay);
           return;
         }
 
@@ -130,18 +140,14 @@ public class Runner {
           textColor = green;
           showNotification("Some jobs are finished!");
         }
-        String jobsStr;
-        if (numOfMyJobs == 1)
-          jobsStr = "job";
-        else
-          jobsStr = "jobs";
+
+        String jobsStr = numOfMyJobs == 1 ? "job" : "jobs";
         showNotification(
             String.format("You have %d " + jobsStr + " RUNNING on the system", numOfMyJobs));
 
         state = 1;
 
         myRunningJobs = myJobs;
-        // numOfRunningJobs = numOfMyJobs;
       } else {
         if (state == 1) {
           shouldNotify = true;
@@ -149,7 +155,6 @@ public class Runner {
         }
         state = 0;
         myRunningJobs.clear();
-        delay = 60;
       }
     } catch (IOException e) {
       System.err.println("There is a problem with the connection: " + e.toString());
@@ -157,6 +162,7 @@ public class Runner {
       System.err.println("Cannot parse the page: " + e.toString());
     }
 
+    updateFrequency();
     TrayIcon newTrayIcon = createTrayIcon();
     getSystemTray().remove(trayIcon);
     trayIcon = newTrayIcon;
@@ -165,9 +171,24 @@ public class Runner {
     } catch (AWTException e) {
       e.printStackTrace();
     }
+  }
 
-    // TODO: Keep track of scheduled jobs
-    scheduler.schedule(() -> checkJobs(), delay, SECONDS);
+  private static void updateFrequency() {
+    if (myRunningJobs.isEmpty()) {
+      changeFrequency(options.getNonTaskFreq());
+    } else {
+      changeFrequency(options.getTaskFreq());
+    }
+  }
+
+  private static void changeFrequency(int period) {
+    if (period == currentFrequency) {
+      return;
+    }
+    System.out.println("Changing polling frequency to:" + period);
+    currentFrequency = period;
+    poller.cancel(false);
+    poller = scheduler.scheduleAtFixedRate(() -> checkJobs(), 5, period, SECONDS);
   }
 
   private static void showNotification(String message) {
@@ -187,12 +208,12 @@ public class Runner {
   }
 
   private static List<JobInfo> fetchJobs() throws IOException, ScriptException {
-    Document doc = Jsoup.connect(Url).get();
+    Document doc = Jsoup.connect(options.getApps(Running)).get();
     Elements metrics = doc.select("#metricsoverview tbody tr td");
     memoryUsed = parseDouble(metrics.get(5).text().split(" ")[0]);
     memoryTotal = parseDouble(metrics.get(6).text().split(" ")[0]);
-    vCoresUsed = parseDouble(metrics.get(7).text().split(" ")[0]);
-    vCoresTotal = parseDouble(metrics.get(8).text().split(" ")[0]);
+    vCoresUsed = parseDouble(metrics.get(8).text().split(" ")[0]);
+    vCoresTotal = parseDouble(metrics.get(9).text().split(" ")[0]);
 
     Elements table = doc.select("#apps");
     Elements tableScript = table.select("script");
@@ -201,14 +222,12 @@ public class Runner {
     ScriptEngine engine = engineManager.getEngineByName("nashorn");
 
     engine.eval(tableScript.html());
-    // Long numOfJobs = (Long) engine.eval("appsTableData.length;");
-    // System.out.println(numOfJobs);
-    // System.out.println(arr);
     String[][] jarr = (String[][]) engine.eval("Java.to(appsTableData,'java.lang.String[][]')");
 
     List<JobInfo> jobs = Arrays.asList(jarr).stream().map(infoArr -> {
       int len = infoArr.length;
-      return JobInfo.of(infoArr[0], infoArr[1], infoArr[2], parseInt(infoArr[len - 5]),
+      String id = Jsoup.parseBodyFragment(infoArr[0]).select("a").html();
+      return JobInfo.of(id, infoArr[1], infoArr[2], parseInt(infoArr[len - 5]),
           parseInt(infoArr[len - 4]), parseInt(infoArr[len - 3]));
     }).collect(toList());
     return jobs;
@@ -217,16 +236,13 @@ public class Runner {
   private static Image newImageWithText(int width, int height, String str) {
     BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
     Graphics2D g = (Graphics2D) image.getGraphics();
-    // System.out.println("writing with " + textColor);
     g.setColor(textColor);
     Font font = new Font("Arial", Font.PLAIN, (int) (height * .6));
     g.setFont(font);
     FontMetrics fontMetrics = g.getFontMetrics(font);
     int strHeight = fontMetrics.getHeight();
     int strWidth = fontMetrics.stringWidth(str);
-    // g.drawString(str, 2, height - (height - strHeight) / 2);
     g.drawString(str, 2, (int) (height * 0.8));
-    // System.out.println(strWidth);
     if (strWidth + 2 < width && strHeight < height) {
       return image.getSubimage(0, 0, strWidth + 2, height);
     }
@@ -237,7 +253,6 @@ public class Runner {
   private static TrayIcon createTrayIcon() {
     PopupMenu pm = new PopupMenu("Hadoop Monitor");
     pm.add(newDisabledMenuItem("-= Your jobs =-"));
-    // pm.addSeparator();
     if (myRunningJobs.isEmpty()) {
       pm.add(newDisabledMenuItem("All finished! ✓"));
     }
@@ -252,6 +267,7 @@ public class Runner {
     otherJobs.forEach(j -> createAndAddTo(pm, j));
 
     addRefreshTo(pm);
+    addOptionsTo(pm);
     addQuitTo(pm);
 
     String text =
@@ -282,6 +298,13 @@ public class Runner {
     pm.add(mi);
   }
 
+  private static void addOptionsTo(PopupMenu pm) {
+    pm.addSeparator();
+    MenuItem mi = new MenuItem("Options");
+    mi.addActionListener(l -> options.openDialog(() -> updateOptions()));
+    pm.add(mi);
+  }
+
   private static void addQuitTo(PopupMenu pm) {
     pm.addSeparator();
     MenuItem mi = new MenuItem("Quit");
@@ -290,8 +313,8 @@ public class Runner {
   }
 
   private static void createAndAddTo(PopupMenu pm, JobInfo j) {
-    MenuItem mi = new MenuItem(j.user + ": " + j.name);
-    mi.addActionListener(e -> openLink(browseUrl + j.id));
+    MenuItem mi = new MenuItem(j.user + ": (" + j.vcores + ") " + j.name);
+    mi.addActionListener(e -> openLink(options.getApp(j.id)));
     pm.add(mi);
   }
 
@@ -317,6 +340,23 @@ public class Runner {
       } catch (Exception e) {
         e.printStackTrace();
       }
+    }
+  }
+
+  private static void updateOptions() {
+    System.out.println("Options updated.");
+    checkJobs();
+  }
+
+  public static class OptionsListener implements NodeChangeListener {
+    @Override
+    public void childAdded(NodeChangeEvent evt) {
+      updateOptions();
+    }
+
+    @Override
+    public void childRemoved(NodeChangeEvent evt) {
+      updateOptions();
     }
   }
 

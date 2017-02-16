@@ -43,7 +43,7 @@
         <configuration>
           <archive>
             <manifest>
-              <mainClass>com.dataspark.haddop-tray.Runner</mainClass>
+              <mainClass>com.dataspark.hadoop_tray.Runner</mainClass>
             </manifest>
           </archive>
           <descriptorRefs>
